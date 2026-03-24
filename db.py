@@ -13,6 +13,10 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Sessions that were successfully inserted — FK-dependent writes are skipped
+# for any session_id not in this set (avoids cascade FK errors when create_session fails).
+_live_sessions: set[str] = set()
+
 # ---------------------------------------------------------------------------
 # Client — lazy singleton so the app starts even without env vars
 # ---------------------------------------------------------------------------
@@ -79,18 +83,37 @@ def _update(table: str, match: dict, payload: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def create_session(session_id: str) -> bool:
-    return _write("sessions", {"id": session_id, "status": "in_progress"})
+    ok = _write("sessions", {"id": session_id, "status": "in_progress"})
+    if ok:
+        _live_sessions.add(session_id)
+    else:
+        log.warning("Session %s not created in Supabase — all writes for this session will be skipped.", session_id)
+    return ok
+
+
+def _session_live(session_id: str) -> bool:
+    """Return False (and skip the write) if the parent session row doesn't exist."""
+    if session_id not in _live_sessions:
+        return False
+    return True
 
 
 def close_session(session_id: str, status: str = "quoted") -> bool:
+    if not _session_live(session_id):
+        return False
+    _live_sessions.discard(session_id)
     return _update("sessions", {"id": session_id}, {"status": status})
 
 
 def insert_client_profile(session_id: str, profile: dict) -> bool:
+    if not _session_live(session_id):
+        return False
     return _write("client_profiles", {"session_id": session_id, **profile})
 
 
 def insert_classification(session_id: str, product: str, reason: str) -> bool:
+    if not _session_live(session_id):
+        return False
     return _write("classifications", {
         "session_id": session_id,
         "product":    product,
@@ -99,6 +122,8 @@ def insert_classification(session_id: str, product: str, reason: str) -> bool:
 
 
 def insert_underwriting_data(session_id: str, product: str, data: dict) -> bool:
+    if not _session_live(session_id):
+        return False
     return _write("underwriting_data", {
         "session_id": session_id,
         "product":    product,
@@ -107,6 +132,8 @@ def insert_underwriting_data(session_id: str, product: str, data: dict) -> bool:
 
 
 def insert_quote(session_id: str, quote: dict) -> bool:
+    if not _session_live(session_id):
+        return False
     valid_until = (date.today() + timedelta(days=quote.get("valid_days", 30))).isoformat()
     return _write("quotes", {
         "session_id":      session_id,
@@ -132,6 +159,8 @@ def insert_turn(
     tool_call_id: str | None = None,
     metadata:    dict[str, Any] | None = None,
 ) -> bool:
+    if not _session_live(session_id):
+        return False
     return _write("conversation_turns", {
         "session_id":   session_id,
         "node":         node,

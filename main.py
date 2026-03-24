@@ -15,7 +15,8 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import TypeVar, Type
+from typing import TypeVar, Type, Callable
+from pydantic import create_model
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -25,6 +26,12 @@ from pydantic import BaseModel, field_validator, ValidationError
 import db
 
 logging.basicConfig(level=logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Injectable input function — override for evals/testing (see evals.py)
+# ---------------------------------------------------------------------------
+# Default: real terminal input. Evals replace this with a SimulatedUser.respond.
+_user_input_fn: Callable | None = None
 
 # LangSmith tracing — enabled automatically when these env vars are set:
 #   LANGCHAIN_TRACING_V2=true
@@ -291,10 +298,21 @@ UNDERWRITER_CHAIN = (
 # State — single source of truth flowing through all nodes
 # ---------------------------------------------------------------------------
 
+# Fields each product requires from ClientProfile before the specialist can begin.
+# Classifier detects any that are empty and passes them as gaps to the specialist.
+PRODUCT_REQUIRED_FIELDS: dict[str, list[str]] = {
+    "general_liability":      ["state_or_province", "city"],
+    "professional_liability": ["state_or_province", "annual_revenue"],
+    "commercial_auto":        ["state_or_province", "employees"],
+    "workers_comp":           ["state_or_province", "employees", "annual_revenue"],
+}
+
+
 class State(BaseModel):
     session_id: str = ""
     client_data: ClientProfile = ClientProfile()
     product: str = ""
+    gaps: list[str] = []          # missing ClientProfile fields the specialist must fill first
     underwriting_data: dict = {}
     quote: dict = {}
 
@@ -302,11 +320,12 @@ class State(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: str, node: str) -> T:
+def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: str, node: str) -> tuple[T, list]:
     """
     Conversational loop shared by receptionist and specialist nodes.
     Runs until Claude calls the bound tool (model_cls).
-    Records every turn to Supabase for audit; returns a typed Pydantic instance.
+    Records every turn to Supabase for audit.
+    Returns (typed instance, full message list) so callers can extract extra values if needed.
     """
     bound_llm = llm.bind_tools([model_cls])
     print(f"\n{'-'*54}\n  {label}\n{'-'*54}\n")
@@ -326,9 +345,7 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: st
         if response.tool_calls:
             tool_call = response.tool_calls[0]
             try:
-                # Pydantic validates zip_code, industry_type, annual_revenue here
                 instance = model_cls(**tool_call["args"])
-                # Record the successful tool submission
                 db.insert_turn(
                     session_id, node, turn, "tool",
                     content=json.dumps(tool_call["args"]),
@@ -336,7 +353,7 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: st
                     tool_call_id=tool_call["id"],
                 )
                 print(f"[{label}]: Thank you, I have all the information I need.\n")
-                return instance
+                return instance, messages
             except ValidationError as exc:
                 error_msg = (
                     "Validation failed — do NOT submit again yet.\n"
@@ -347,7 +364,7 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: st
                 db.insert_turn(session_id, node, turn, "tool", content=error_msg,
                                tool_name=tool_call["name"], tool_call_id=tool_call["id"])
                 turn += 1
-                continue  # back to top of loop — LLM will explain and re-collect
+                continue
 
         # Conversational reply — record assistant turn, then prompt user
         assistant_text = response.content if isinstance(response.content, str) else json.dumps(response.content)
@@ -355,7 +372,10 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: st
         turn += 1
 
         print(f"[{label}]: {response.content}\n")
-        user_input = input("You: ").strip() or "Please continue."
+        if _user_input_fn is not None:
+            user_input = _user_input_fn(str(response.content)) or "Please continue."
+        else:
+            user_input = input("You: ").strip() or "Please continue."
         db.insert_turn(session_id, node, turn, "user", user_input)
         turn += 1
         messages.append(HumanMessage(content=user_input))
@@ -363,13 +383,39 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: st
     raise RuntimeError(f"{label}: max turns ({MAX_TURNS}) reached without completing intake — aborting pipeline.")
 
 
+def _extract_gap_values(messages: list, gaps: list[str]) -> dict:
+    """
+    One-shot extraction: given the completed specialist conversation and a list
+    of field names that were missing from ClientProfile, return a dict of
+    {field: value} to merge back into client_data.
+    """
+    GapModel = create_model("GapModel", **{f: (str, "") for f in gaps})
+    chain = (
+        ChatPromptTemplate.from_messages([
+            ("system",
+             "Extract the following fields from the conversation transcript below. "
+             "Return an empty string for any field that was not mentioned.\n"
+             f"Fields to extract: {', '.join(gaps)}"),
+            ("human", "{transcript}"),
+        ])
+        | llm.with_structured_output(GapModel)
+    )
+    transcript = "\n".join(
+        f"{m.type.upper()}: {m.content}"
+        for m in messages
+        if hasattr(m, "content") and isinstance(m.content, str) and m.content
+    )
+    result = chain.invoke({"transcript": transcript})
+    return {k: v for k, v in result.model_dump().items() if v}
+
+
 # ---------------------------------------------------------------------------
 # Nodes — each reads from state, returns only what it changes
 # ---------------------------------------------------------------------------
 
 def receptionist_node(state: State) -> dict:
-    profile = _converse(RECEPTIONIST_PROMPT, "Receptionist", ClientProfile,
-                        state.session_id, "receptionist")
+    profile, _ = _converse(RECEPTIONIST_PROMPT, "Receptionist", ClientProfile,
+                           state.session_id, "receptionist")
     print(f"[System]: Profile collected → {profile.model_dump()}\n")
     db.insert_client_profile(state.session_id, profile.model_dump())
     return {"client_data": profile}
@@ -383,19 +429,42 @@ def classifier_node(state: State) -> dict:
         product = "general_liability"
     print(f"[System]: Routing to {product.replace('_', ' ').title()} specialist.")
     print(f"[Reason]: {result.reason}\n")
+
+    profile = state.client_data.model_dump()
+    gaps    = [f for f in PRODUCT_REQUIRED_FIELDS.get(product, []) if not profile.get(f)]
+    if gaps:
+        print(f"[System]: Gap detected — specialist will collect missing fields: {gaps}\n")
+
     db.insert_classification(state.session_id, product, result.reason)
-    return {"product": product}
+    return {"product": product, "gaps": gaps}
 
 
 def specialist_node(state: State) -> dict:
     prompt = SPECIALIST_PROMPTS.get(state.product, SPECIALIST_PROMPTS["general_liability"])
+    if state.gaps:
+        gap_list = ", ".join(state.gaps)
+        prompt = (
+            f"Before your normal questions, you must collect these missing fields "
+            f"from the client profile: {gap_list}. "
+            f"Ask for them naturally as part of your opening, then continue as normal.\n\n"
+        ) + prompt
     label = f"{state.product.replace('_', ' ').title()} Specialist"
     model_cls = UNDERWRITING_MODELS.get(state.product, GeneralLiabilityData)
-    data = _converse(prompt, label, model_cls, state.session_id, "specialist")
+    data, messages = _converse(prompt, label, model_cls, state.session_id, "specialist")
     print(f"[System]: Underwriting data collected → {data.model_dump_json()}\n")
     db.insert_underwriting_data(state.session_id, state.product, data.model_dump())
-    # Store as dict — State.underwriting_data is untyped (four possible shapes)
-    return {"underwriting_data": data.model_dump()}
+
+    # Back-fill any gap values into client_data so the underwriter has complete info
+    updates = {}
+    if state.gaps:
+        gap_values = _extract_gap_values(messages, state.gaps)
+        if gap_values:
+            print(f"[System]: Back-filling client profile gaps: {gap_values}\n")
+            updates["client_data"] = ClientProfile(
+                **{**state.client_data.model_dump(), **gap_values}
+            )
+
+    return {"underwriting_data": data.model_dump(), **updates}
 
 
 def underwriter_node(state: State) -> dict:
@@ -430,20 +499,22 @@ def underwriter_node(state: State) -> dict:
 # Entry point — graph built here so checkpointer opens at run time, not import
 # ---------------------------------------------------------------------------
 
-def main():
+def build_graph(checkpointer):
+    """Compile the LangGraph pipeline. Accepts any checkpointer (Postgres or Memory)."""
     builder = StateGraph(State)
-
     builder.add_node("receptionist", receptionist_node)
     builder.add_node("classifier",   classifier_node)
     builder.add_node("specialist",   specialist_node)
     builder.add_node("underwriter",  underwriter_node)
-
     builder.set_entry_point("receptionist")
     builder.add_edge("receptionist", "classifier")
     builder.add_edge("classifier",   "specialist")
     builder.add_edge("specialist",   "underwriter")
     builder.add_edge("underwriter",  END)
+    return builder.compile(checkpointer=checkpointer)
 
+
+def main():
     pg_url = os.environ.get("SUPABASE_DB_URL", "")
     if not pg_url:
         raise RuntimeError(
@@ -457,8 +528,8 @@ def main():
     db.create_session(session_id)
 
     with PostgresSaver.from_conn_string(pg_url) as checkpointer:
-        checkpointer.setup()   # creates langgraph checkpoint tables if they don't exist
-        graph = builder.compile(checkpointer=checkpointer)
+        checkpointer.setup()
+        graph = build_graph(checkpointer)
 
         print("\n" + "=" * 54)
         print("  Virtual Insurance Agency — AI Quote System (LangGraph)")
