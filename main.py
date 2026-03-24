@@ -11,16 +11,25 @@ Graph (linear):
 """
 
 import json
-import re
+import logging
+import os
 import uuid
 from pathlib import Path
 from typing import TypeVar, Type
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, field_validator, ValidationError
+import db
+
+logging.basicConfig(level=logging.WARNING)
+
+# LangSmith tracing — enabled automatically when these env vars are set:
+#   LANGCHAIN_TRACING_V2=true
+#   LANGCHAIN_API_KEY=ls__...
+#   LANGCHAIN_PROJECT=InsurancePoC   (optional, groups runs in the UI)
 
 MODEL = "claude-sonnet-4-6"
 MAX_TURNS = 15
@@ -93,21 +102,13 @@ class ClientProfile(BaseModel):
     email: str = ""
     phone: str = ""
     city: str = ""
-    state: str = ""
-    zip_code: str = ""          # validated: exactly 5 digits
+    state_or_province: str = ""
+    country: str = ""
+    postal_code: str = ""       # any format (US ZIP, UK postcode, etc.)
     industry_type: str = ""     # validated: must be a key in INDUSTRY_TYPES
     annual_revenue: int = 0     # validated: positive integer (LLM converts "eighty thousand" → 80000)
     employees: int = 0
     years_in_business: int = 0
-
-    @field_validator("zip_code")
-    @classmethod
-    def validate_zip_code(cls, v: str) -> str:
-        if v and not re.fullmatch(r"\d{5}", v):
-            raise ValueError(
-                f"'{v}' is not a valid ZIP code. Must be exactly 5 digits (e.g. 11201)."
-            )
-        return v
 
     @field_validator("industry_type")
     @classmethod
@@ -200,7 +201,7 @@ Collect the following from the client through natural conversation:
   2. Owner / contact name
   3. Email address
   4. Phone number
-  5. City, state, and ZIP code (5-digit ZIP — ask for it if they only give a city)
+  5. City, state/province, country, and postal code
   6. Industry type — you MUST map what they say to one of the accepted values listed below.
      Accepted values: {", ".join(INDUSTRY_TYPES)}
      Example: "bakery" → bakery_and_food_production
@@ -291,6 +292,7 @@ UNDERWRITER_CHAIN = (
 # ---------------------------------------------------------------------------
 
 class State(BaseModel):
+    session_id: str = ""
     client_data: ClientProfile = ClientProfile()
     product: str = ""
     underwriting_data: dict = {}
@@ -300,15 +302,20 @@ class State(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _converse(system_prompt: str, label: str, model_cls: Type[T]) -> T:
+def _converse(system_prompt: str, label: str, model_cls: Type[T], session_id: str, node: str) -> T:
     """
     Conversational loop shared by receptionist and specialist nodes.
     Runs until Claude calls the bound tool (model_cls).
-    Returns a typed Pydantic instance — no raw dicts.
+    Records every turn to Supabase for audit; returns a typed Pydantic instance.
     """
     bound_llm = llm.bind_tools([model_cls])
-    print(f"\n{'─'*54}\n  {label}\n{'─'*54}\n")
+    print(f"\n{'-'*54}\n  {label}\n{'-'*54}\n")
     messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please begin.")]
+    turn = 0
+
+    # Record the system prompt once
+    db.insert_turn(session_id, node, turn, "system", system_prompt)
+    turn += 1
 
     for _ in range(MAX_TURNS):
         response = bound_llm.invoke(messages)
@@ -321,23 +328,36 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T]) -> T:
             try:
                 # Pydantic validates zip_code, industry_type, annual_revenue here
                 instance = model_cls(**tool_call["args"])
+                # Record the successful tool submission
+                db.insert_turn(
+                    session_id, node, turn, "tool",
+                    content=json.dumps(tool_call["args"]),
+                    tool_name=tool_call["name"],
+                    tool_call_id=tool_call["id"],
+                )
                 print(f"[{label}]: Thank you, I have all the information I need.\n")
                 return instance
             except ValidationError as exc:
-                # Feed the error back so the LLM re-asks only the broken fields
-                messages.append(ToolMessage(
-                    content=(
-                        "Validation failed — do NOT submit again yet.\n"
-                        "Re-ask the user only for the fields listed below, then retry:\n\n"
-                        f"{exc}"
-                    ),
-                    tool_call_id=tool_call["id"],
-                ))
+                error_msg = (
+                    "Validation failed — do NOT submit again yet.\n"
+                    "Re-ask the user only for the fields listed below, then retry:\n\n"
+                    f"{exc}"
+                )
+                messages.append(ToolMessage(content=error_msg, tool_call_id=tool_call["id"]))
+                db.insert_turn(session_id, node, turn, "tool", content=error_msg,
+                               tool_name=tool_call["name"], tool_call_id=tool_call["id"])
+                turn += 1
                 continue  # back to top of loop — LLM will explain and re-collect
 
-        # Conversational reply — prompt user
+        # Conversational reply — record assistant turn, then prompt user
+        assistant_text = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        db.insert_turn(session_id, node, turn, "assistant", assistant_text)
+        turn += 1
+
         print(f"[{label}]: {response.content}\n")
         user_input = input("You: ").strip() or "Please continue."
+        db.insert_turn(session_id, node, turn, "user", user_input)
+        turn += 1
         messages.append(HumanMessage(content=user_input))
 
     raise RuntimeError(f"{label}: max turns ({MAX_TURNS}) reached without completing intake — aborting pipeline.")
@@ -348,8 +368,10 @@ def _converse(system_prompt: str, label: str, model_cls: Type[T]) -> T:
 # ---------------------------------------------------------------------------
 
 def receptionist_node(state: State) -> dict:
-    profile = _converse(RECEPTIONIST_PROMPT, "Receptionist", ClientProfile)
+    profile = _converse(RECEPTIONIST_PROMPT, "Receptionist", ClientProfile,
+                        state.session_id, "receptionist")
     print(f"[System]: Profile collected → {profile.model_dump()}\n")
+    db.insert_client_profile(state.session_id, profile.model_dump())
     return {"client_data": profile}
 
 
@@ -361,6 +383,7 @@ def classifier_node(state: State) -> dict:
         product = "general_liability"
     print(f"[System]: Routing to {product.replace('_', ' ').title()} specialist.")
     print(f"[Reason]: {result.reason}\n")
+    db.insert_classification(state.session_id, product, result.reason)
     return {"product": product}
 
 
@@ -368,8 +391,9 @@ def specialist_node(state: State) -> dict:
     prompt = SPECIALIST_PROMPTS.get(state.product, SPECIALIST_PROMPTS["general_liability"])
     label = f"{state.product.replace('_', ' ').title()} Specialist"
     model_cls = UNDERWRITING_MODELS.get(state.product, GeneralLiabilityData)
-    data = _converse(prompt, label, model_cls)
+    data = _converse(prompt, label, model_cls, state.session_id, "specialist")
     print(f"[System]: Underwriting data collected → {data.model_dump_json()}\n")
+    db.insert_underwriting_data(state.session_id, state.product, data.model_dump())
     # Store as dict — State.underwriting_data is untyped (four possible shapes)
     return {"underwriting_data": data.model_dump()}
 
@@ -398,6 +422,8 @@ def underwriter_node(state: State) -> dict:
         json.dump(quote_dict, f, indent=2)
     print(f"\nSaved to: {out_path}")
 
+    db.insert_quote(state.session_id, quote_dict)
+    db.close_session(state.session_id, "quoted")
     return {"quote": quote_dict}
 
 # ---------------------------------------------------------------------------
@@ -418,19 +444,32 @@ def main():
     builder.add_edge("specialist",   "underwriter")
     builder.add_edge("underwriter",  END)
 
-    db_path = Path(__file__).parent / "sessions.db"
-    thread_id = str(uuid.uuid4())
+    pg_url = os.environ.get("SUPABASE_DB_URL", "")
+    if not pg_url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL not set.\n"
+            "Set it as a DSN keyword string to avoid URI parsing issues with dotted usernames:\n"
+            "  host=aws-0-<region>.pooler.supabase.com port=5432 dbname=postgres "
+            "user=postgres.<ref> password=<password> sslmode=require"
+        )
 
-    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+    session_id = str(uuid.uuid4())
+    db.create_session(session_id)
+
+    with PostgresSaver.from_conn_string(pg_url) as checkpointer:
+        checkpointer.setup()   # creates langgraph checkpoint tables if they don't exist
         graph = builder.compile(checkpointer=checkpointer)
 
         print("\n" + "=" * 54)
         print("  Virtual Insurance Agency — AI Quote System (LangGraph)")
         print("=" * 54)
-        print(f"Session: {thread_id}")
+        print(f"Session: {session_id}")
         print("Answer the agent's questions to receive a quote.\n")
 
-        graph.invoke(State(), config={"configurable": {"thread_id": thread_id}})
+        graph.invoke(
+            State(session_id=session_id),
+            config={"configurable": {"thread_id": session_id}},
+        )
 
 
 if __name__ == "__main__":

@@ -7,13 +7,17 @@ langchain-anthropic
 langchain-core
 langchain-text-splitters
 langchain-community
-langgraph.checkpoint.sqlite
+langgraph-checkpoint-postgres
+psycopg[binary]
 
 # LangGraph (L13+)
 langgraph
 
 # Pydantic (state validation)
 pydantic
+
+# Supabase persistence
+supabase
 
 # Async HTTP (used by anthropic SDK)
 httpx
