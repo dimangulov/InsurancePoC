@@ -87,3 +87,12 @@ python main.py
 ```
 
 The agent will ask questions interactively and print the final quote to the console and to a `quote_<id>.json` file.
+
+## Docs
+
+| Document | Description |
+|---|---|
+| [CLAUDE.md](CLAUDE.md) | Contributor rules: schema sync, security layer sync, eval sync |
+| [db_design.md](db_design.md) | Database schema design and table relationships |
+| [security_design.md](security_design.md) | Auditor security layer design and threat model |
+| [evals_design.md](evals_design.md) | Eval suite design, personas, and scoring criteria |
