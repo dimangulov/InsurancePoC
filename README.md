@@ -22,8 +22,10 @@ A conversational AI quote system that walks a small-business owner through an in
 **Key design choices:**
 - All LLM I/O goes through Pydantic models — no raw JSON parsing in prompts
 - Completion is signalled by a `tool_use` call, not `{"done": true}` sentinel
-- Sessions are persisted to `sessions.db` (SQLite) via LangGraph's `SqliteSaver`
+- LangGraph graph state checkpointed to Supabase (PostgreSQL) via `PostgresSaver`
+- Structured outputs written to Supabase tables for audit (`sessions`, `client_profiles`, `classifications`, `underwriting_data`, `quotes`, `conversation_turns`)
 - Each run saves a `quote_<id>.json` file next to `main.py`
+- LangSmith tracing supported via env vars (zero-code)
 
 ## Setup
 
@@ -56,17 +58,29 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Set your API key
+### 4. Set environment variables
 
-```bash
+**Required:**
+```powershell
 # Windows PowerShell
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
-
-# macOS / Linux
-export ANTHROPIC_API_KEY="sk-ant-..."
+$env:SUPABASE_URL      = "https://<ref>.supabase.co"
+$env:SUPABASE_KEY      = "<service-role-key>"
+$env:SUPABASE_DB_URL   = "host=aws-0-<region>.pooler.supabase.com port=5432 dbname=postgres user=postgres.<ref> password=<password> sslmode=require"
 ```
 
-### 5. Run
+**Optional — LangSmith tracing:**
+```powershell
+$env:LANGCHAIN_TRACING_V2 = "true"
+$env:LANGCHAIN_API_KEY    = "ls__..."
+$env:LANGCHAIN_PROJECT    = "InsurancePoC"
+```
+
+### 5. Apply the database schema
+
+Run `schema.sql` once in the Supabase SQL editor. If upgrading from a previous version, run the numbered `migrate_NNN_*.sql` files instead.
+
+### 6. Run
 
 ```bash
 python main.py

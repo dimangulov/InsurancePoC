@@ -78,16 +78,16 @@ Insurance applications have strict audit requirements: every quote must be repro
 
 ---
 
-## Decision 5 — LangGraph SqliteSaver kept alongside Supabase
+## Decision 5 — LangGraph checkpointer on Supabase (PostgreSQL)
 
-The app uses two persistence mechanisms in parallel:
+The app uses a single persistence backend — Supabase — for both layers:
 
 | Layer | Purpose |
 |---|---|
-| LangGraph `SqliteSaver` (`sessions.db`) | Graph state resumption — if the process crashes mid-conversation, LangGraph can resume from the last checkpoint |
-| Supabase | Structured audit log — queryable, long-term, cross-session analytics |
+| LangGraph `PostgresSaver` | Graph state resumption — if the process crashes mid-conversation, LangGraph can resume from the last checkpoint |
+| Supabase business tables | Structured audit log — queryable, long-term, cross-session analytics |
 
-The SQLite checkpoint is an implementation detail of the runtime; the Supabase tables are the system of record for business and compliance purposes.
+`PostgresSaver.setup()` creates its own checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`) on first run. These are managed by LangGraph and separate from the business tables defined in `schema.sql`.
 
 ---
 
@@ -115,9 +115,10 @@ ORDER  BY node, turn_index;
 1. Run `schema.sql` against your Supabase project (SQL editor or `psql`)
 2. Set environment variables:
    ```bash
-   export SUPABASE_URL="https://<project>.supabase.co"
-   export SUPABASE_KEY="<anon-or-service-role-key>"
+   export SUPABASE_URL="https://<ref>.supabase.co"
+   export SUPABASE_KEY="<service-role-key>"
+   export SUPABASE_DB_URL="host=aws-0-<region>.pooler.supabase.com port=5432 dbname=postgres user=postgres.<ref> password=<password> sslmode=require"
    ```
-3. `pip install supabase`
+3. `pip install -r requirements.txt`
 
-If the env vars are absent the app runs normally — Supabase writes are skipped with a warning and the LangGraph SQLite checkpoint continues to function.
+`SUPABASE_DB_URL` is required — the app will not start without it. `SUPABASE_URL` / `SUPABASE_KEY` are best-effort; if absent, structured table writes are skipped with a warning but the app still runs.
