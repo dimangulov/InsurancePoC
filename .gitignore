@@ -5,3 +5,5 @@ __pycache__/
 .env
 *.db
 *.sqlite
+eval_results.json
+quote_*.json
