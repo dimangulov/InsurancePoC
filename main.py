@@ -22,8 +22,10 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, field_validator, ValidationError
+from pydantic import BaseModel, field_validator, model_validator, ValidationError
 import db
+from pricing import PremiumCalculator
+from auditor  import audit_quote
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -177,15 +179,55 @@ class WorkersCompData(BaseModel):
 
 
 class InsuranceQuote(BaseModel):
-    quote_id: str
-    product: str
-    coverage_limit: str
-    annual_premium: int
+    quote_id:        str
+    product:         str
+    coverage_limit:  str
+    annual_premium:  int
     monthly_premium: int
-    deductible: int
-    exclusions: list[str]
-    notes: str
-    valid_days: int = 30
+    deductible:      int
+    exclusions:      list[str]
+    notes:           str
+    valid_days:      int = 30
+
+    @field_validator("annual_premium")
+    @classmethod
+    def premium_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"annual_premium must be > 0, got {v}")
+        return v
+
+    @field_validator("monthly_premium")
+    @classmethod
+    def monthly_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"monthly_premium must be > 0, got {v}")
+        return v
+
+    @field_validator("deductible")
+    @classmethod
+    def deductible_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"deductible must be >= 0, got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def monthly_consistent_with_annual(self) -> "InsuranceQuote":
+        import math
+        expected = math.ceil(self.annual_premium / 12)
+        if abs(self.monthly_premium - expected) > 1:
+            raise ValueError(
+                f"monthly_premium {self.monthly_premium} inconsistent with "
+                f"annual_premium {self.annual_premium} (expected ~{expected})"
+            )
+        return self
+
+
+class LLMQuoteContent(BaseModel):
+    """What the underwriter LLM is permitted to decide — no financial fields."""
+    quote_id:       str
+    coverage_limit: str
+    exclusions:     list[str]
+    notes:          str
 
 
 # Map product key → specialist model class
@@ -276,8 +318,17 @@ Ask 1-2 questions at a time. When you have all five, call the submit_data tool.
 }
 
 UNDERWRITER_PROMPT = """You are a senior insurance underwriter.
-Given a client profile and underwriting details, produce a realistic quote.
-Call the submit_result tool with the completed quote.
+Given a client profile and underwriting details, produce the descriptive parts of a quote.
+You decide: quote_id, coverage_limit, exclusions, and notes.
+Do NOT set premiums, deductibles, or any financial figures — those are computed separately.
+
+quote_id format: use the product prefix (GL, PL, CA, WC) + client abbreviation + year + sequence.
+  Example: "GL-SWEETDREAMS-2024-001"
+coverage_limit: use the value the client chose during the specialist conversation.
+exclusions: list 3–6 standard exclusions appropriate for this product and business type.
+notes: 1–2 sentences about underwriting considerations for this account.
+
+Call the submit_result tool with the completed content.
 """
 
 # ---------------------------------------------------------------------------
@@ -291,7 +342,7 @@ CLASSIFIER_CHAIN = (
 
 UNDERWRITER_CHAIN = (
     ChatPromptTemplate.from_messages([("system", UNDERWRITER_PROMPT), ("human", "{details}")])
-    | llm.with_structured_output(InsuranceQuote)
+    | llm.with_structured_output(LLMQuoteContent)
 )
 
 # ---------------------------------------------------------------------------
@@ -469,13 +520,39 @@ def specialist_node(state: State) -> dict:
 
 def underwriter_node(state: State) -> dict:
     print("[System]: Generating quote...\n")
-    quote = UNDERWRITER_CHAIN.invoke({"details": json.dumps({
-        "client": state.client_data.model_dump(),
-        "product": state.product,
+
+    # Step 1 — LLM generates only non-financial content
+    llm_content: LLMQuoteContent = UNDERWRITER_CHAIN.invoke({"details": json.dumps({
+        "client":               state.client_data.model_dump(),
+        "product":              state.product,
         "underwriting_details": state.underwriting_data,
     })})
 
-    # Merge client info into quote dict for display and persistence
+    # Step 2 — Audit for injection attacks and policy violations
+    # audit_quote() raises RuntimeError if action=="block"
+    audit_result = audit_quote(llm_content.model_dump(), state.product)
+    if audit_result.flags:
+        print(f"[Auditor]: {audit_result.action.upper()} — {audit_result.flags}")
+
+    # Step 3 — Deterministic premium calculation (LLM never touches these)
+    premium = PremiumCalculator.calculate(
+        state.product,
+        state.client_data.model_dump(),
+        state.underwriting_data,
+    )
+
+    # Step 4 — Assemble and validate the full quote
+    quote = InsuranceQuote(
+        quote_id        = llm_content.quote_id,
+        product         = state.product,
+        coverage_limit  = audit_result.normalized_coverage_limit or llm_content.coverage_limit,
+        annual_premium  = premium.annual_premium,
+        monthly_premium = premium.monthly_premium,
+        deductible      = premium.deductible,
+        exclusions      = audit_result.sanitized_exclusions,
+        notes           = audit_result.sanitized_notes,
+    )
+
     quote_dict = quote.model_dump()
     quote_dict["client"] = state.client_data.model_dump()
 
